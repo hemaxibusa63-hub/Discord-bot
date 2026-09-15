@@ -1,14 +1,18 @@
 services:
   - type: web
-    name: krutik-cyber-expert-discord-bot
+    name: team-xyz-discord-bot
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python bot_hosting_webservice_env.py
-
     envVars:
       - key: DISCORD_TOKEN
         sync: false
-
-      - key: OWNER_ID
-        value: "1378993981769252966"
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-3.6-flash
+      - key: STORAGE_CHANNEL_ID
+        sync: false
+      - key: DB_PATH
+        value: team_xyz.db
