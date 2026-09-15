@@ -16,4 +16,3 @@ services:
         sync: false
       - key: DB_PATH
         value: team_xyz.db
-        
