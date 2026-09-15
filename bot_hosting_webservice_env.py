@@ -1217,88 +1217,65 @@ async def activity_command(interaction: discord.Interaction):
 # ============================================================
 
 def make_ai_context(user_id: int):
+    """Build a compact, bounded AI context to reduce Gemini request load."""
     info = TEAM[user_id]
-
     parts = [
         f"Team: {BRAND}",
         f"Current member: {info['name']}",
         f"Current member role: {info['role']}",
-        "",
         "ROSTER:",
     ]
-
     for uid, member in TEAM.items():
-        parts.append(
-            f"- {member['name']} | {member['role']} | Discord ID {uid}"
-        )
+        parts.append(f"- {member['name']} | {member['role']} | ID {uid}")
 
-    parts.append("\nRECENT SCRIMS:")
-    for row in execute(
-        """SELECT opponent,scheduled_at,map,result,notes
-           FROM scrims ORDER BY id DESC LIMIT 10""",
-        fetch=True,
-    ):
-        parts.append(str(dict(row)))
+    def add_rows(title, sql, formatter=str):
+        parts.append(f"\\n{title}:")
+        for row in execute(sql, fetch=True):
+            parts.append(formatter(row))
 
-    parts.append("\nRECENT TOURNAMENTS:")
-    for row in execute(
-        """SELECT name,scheduled_at,result,placement,points,notes
-           FROM tournaments ORDER BY id DESC LIMIT 10""",
-        fetch=True,
-    ):
-        parts.append(str(dict(row)))
+    add_rows("RECENT SCRIMS", """SELECT opponent,scheduled_at,map,result,notes FROM scrims ORDER BY id DESC LIMIT 6""", lambda r: str(dict(r)))
+    add_rows("RECENT TOURNAMENTS", """SELECT name,scheduled_at,result,placement,points,notes FROM tournaments ORDER BY id DESC LIMIT 4""", lambda r: str(dict(r)))
+    add_rows("RECENT MATCHES", """SELECT title,opponent,match_type,scheduled_at,map,result,notes FROM matches ORDER BY id DESC LIMIT 6""", lambda r: str(dict(r)))
+    add_rows("PLAYER STATS", """SELECT user_id,COUNT(*) games,SUM(kills) kills,ROUND(SUM(damage),1) damage,SUM(booyah) booyah,SUM(points) points FROM player_stats GROUP BY user_id""", lambda r: f"{member_text(r['user_id'])}: {dict(r)}")
+    add_rows("RECENT STRATEGIES", """SELECT category,title,content FROM strategies ORDER BY id DESC LIMIT 8""", lambda r: str(dict(r)))
+    add_rows("RECENT TRAINING", """SELECT category,goal,scheduled_at,progress,notes FROM training ORDER BY id DESC LIMIT 8""", lambda r: str(dict(r)))
+    add_rows("RECENT TEAM CHAT", """SELECT user_id,content,created_at FROM chat_context ORDER BY id DESC LIMIT 12""", lambda r: f"{member_text(r['user_id'])}: {str(r['content'])[:700]}")
 
-    parts.append("\nMATCHES:")
-    for row in execute(
-        """SELECT title,opponent,match_type,scheduled_at,map,result,notes
-           FROM matches ORDER BY id DESC LIMIT 10""",
-        fetch=True,
-    ):
-        parts.append(str(dict(row)))
+    # Final character cap keeps even a busy team from generating oversized prompts.
+    return "\n".join(parts)[:14000]
 
-    parts.append("\nPLAYER STATS:")
-    for row in execute(
-        """SELECT user_id,
-                  COUNT(*) games,
-                  SUM(kills) kills,
-                  SUM(damage) damage,
-                  SUM(booyah) booyah,
-                  SUM(points) points
-           FROM player_stats
-           GROUP BY user_id""",
-        fetch=True,
-    ):
-        parts.append(
-            f"{member_text(row['user_id'])}: {dict(row)}"
-        )
 
-    parts.append("\nSTRATEGIES:")
-    for row in execute(
-        """SELECT category,title,content
-           FROM strategies ORDER BY id DESC LIMIT 15""",
-        fetch=True,
-    ):
-        parts.append(str(dict(row)))
+# Up to four AI requests can be processed concurrently, matching the four TEAM XYZ
+# members. A request never blocks another member indefinitely.
+ai_slots = asyncio.Semaphore(4)
 
-    parts.append("\nTRAINING:")
-    for row in execute(
-        """SELECT category,goal,scheduled_at,progress,notes
-           FROM training ORDER BY id DESC LIMIT 15""",
-        fetch=True,
-    ):
-        parts.append(str(dict(row)))
 
-    parts.append("\nRECENT TEAM CHAT:")
-    for row in execute(
-        """SELECT user_id,content,created_at
-           FROM chat_context ORDER BY id DESC LIMIT 40""",
-        fetch=True,
-    ):
-        parts.append(
-            f"{member_text(row['user_id'])}: {row['content']}"
-        )
+def is_transient_gemini_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(key in text for key in (
+        "503", "unavailable", "high demand", "429", "rate limit",
+        "resource exhausted", "temporarily unavailable", "overloaded"
+    ))
 
-    return "\n".join(parts)[-30000:]
+
+async def generate_ai_response(prompt: str):
+    """Run Gemini off the Discord event loop with retry/backoff."""
+    async with ai_slots:
+        last_error = None
+        for attempt in range(4):
+            try:
+                return await asyncio.to_thread(
+                    gemini_client.models.generate_content,
+                    model=GEMINI_MODEL,
+                    contents=prompt,
+                )
+            except Exception as exc:
+                last_error = exc
+                if not is_transient_gemini_error(exc) or attempt >= 3:
+                    raise
+                # 2s, 4s, 8s. This prevents rapid retry bursts during Gemini overload.
+                await asyncio.sleep(2 ** attempt)
+        raise last_error or RuntimeError("Gemini request failed")
 
 
 @tree.command(
@@ -1313,33 +1290,34 @@ async def ai_command(
 ):
     if not GEMINI_API_KEY:
         await interaction.response.send_message(
-            "❌ GEMINI_API_KEY is not configured in Render.",
-            ephemeral=True,
+            "❌ GEMINI_API_KEY is not configured in Render.", ephemeral=True
         )
         return
-
     if gemini_client is None:
         await interaction.response.send_message(
-            "❌ Gemini client is unavailable. Check API key and package.",
-            ephemeral=True,
+            "❌ Gemini client is unavailable. Check API key and package.", ephemeral=True
         )
         return
 
-    await interaction.response.defer()
+    question = (question or "").strip()
+    if not question:
+        await interaction.response.send_message("❌ Please enter a question.", ephemeral=True)
+        return
+    question = question[:3500]
 
+    await interaction.response.defer(thinking=True)
+
+    info = TEAM[interaction.user.id]
     context = make_ai_context(interaction.user.id)
+    prompt = f"""You are the official AI esports coach for {BRAND}.
+The user explicitly invoked /ai. Do not react to normal chat automatically.
+Give practical Free Fire esports advice. Know the four players and their roles.
+Tailor the answer to the requesting member when relevant.
+Never invent team facts; say when data is unavailable.
+Keep the answer useful and concise.
 
-    prompt = f"""
-You are the official AI esports assistant for {BRAND}.
-
-The user explicitly invoked /ai.
-Do not respond to normal chat automatically.
-
-Use the supplied team context.
-Know each player's role.
-Give role-specific Free Fire esports advice.
-Do not invent team facts.
-Be practical and concise.
+REQUESTING MEMBER: {info['name']}
+ROLE: {info['role']}
 
 TEAM CONTEXT:
 {context}
@@ -1349,36 +1327,28 @@ USER QUESTION:
 """
 
     try:
-        response = await asyncio.to_thread(
-            gemini_client.models.generate_content,
-            model=GEMINI_MODEL,
-            contents=prompt,
-        )
-
-        answer = getattr(response, "text", None)
-
+        response = await generate_ai_response(prompt)
+        answer = (getattr(response, "text", None) or "").strip()
         if not answer:
-            answer = "Gemini returned no text."
-
+            answer = "Gemini returned no text. Please try again."
         if len(answer) > 1900:
-            answer = answer[:1900] + "\n…"
+            answer = answer[:1900] + "…"
 
         await interaction.followup.send(
-            f"🤖 **TEAM XYZ AI — "
-            f"{TEAM[interaction.user.id]['name']}**\n{answer}"
+            f"🤖 **TEAM XYZ AI — {info['name']}**\n{answer}"
         )
-
-        log_activity(
-            interaction.user.id,
-            "ai",
-            question[:300],
-        )
+        log_activity(interaction.user.id, "ai", question[:300])
 
     except Exception as exc:
-        await interaction.followup.send(
-            f"❌ Gemini error:\n`{type(exc).__name__}: "
-            f"{str(exc)[:700]}`"
-        )
+        error = f"{type(exc).__name__}: {str(exc)[:500]}"
+        if is_transient_gemini_error(exc):
+            message = (
+                "⚠️ Gemini is temporarily busy/unavailable. "
+                "The bot automatically retried the request. Please try /ai again shortly."
+            )
+        else:
+            message = "❌ Gemini request failed, but the TEAM XYZ bot is still running."
+        await interaction.followup.send(f"{message}\n`{error}`")
 
 
 # ============================================================
