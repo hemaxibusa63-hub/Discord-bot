@@ -43,7 +43,7 @@ TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 OWNER_ID_RAW = os.getenv("OWNER_ID", "").strip()
 DB_PATH = os.getenv("DB_PATH", "krutik_discord.db").strip()
 
-BRAND = "KRUTIK CYBER EXPERT"
+BRAND = "TEAM XYZ BOT"
 
 if not TOKEN:
     raise RuntimeError(
