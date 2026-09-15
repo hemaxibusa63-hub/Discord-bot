@@ -24,6 +24,10 @@ BRAND = "TEAM XYZ"
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash").strip()
+GEMINI_FALLBACK_MODELS = [
+    x.strip() for x in os.getenv("GEMINI_FALLBACK_MODELS", "gemini-2.5-flash").split(",")
+    if x.strip()
+]
 DB_PATH = os.getenv("DB_PATH", "team_xyz.db").strip() or "team_xyz.db"
 
 try:
@@ -1254,27 +1258,53 @@ def is_transient_gemini_error(exc: Exception) -> bool:
     text = str(exc).lower()
     return any(key in text for key in (
         "503", "unavailable", "high demand", "429", "rate limit",
-        "resource exhausted", "temporarily unavailable", "overloaded"
+        "resource exhausted", "temporarily unavailable", "overloaded",
+        "service unavailable", "deadline exceeded",
     ))
 
 
+def split_discord_text(text: str, limit: int = 1900):
+    text = str(text or "")
+    return [text[i:i + limit] for i in range(0, len(text), limit)] or [""]
+
+
+async def _gemini_call(model: str, prompt: str):
+    return await asyncio.to_thread(
+        gemini_client.models.generate_content,
+        model=model,
+        contents=prompt,
+    )
+
+
 async def generate_ai_response(prompt: str):
-    """Run Gemini off the Discord event loop with retry/backoff."""
+    """Concurrent Gemini calls with bounded retries and model fallback."""
     async with ai_slots:
+        models_to_try = []
+        for model in [GEMINI_MODEL, *GEMINI_FALLBACK_MODELS]:
+            if model and model not in models_to_try:
+                models_to_try.append(model)
+
         last_error = None
-        for attempt in range(4):
-            try:
-                return await asyncio.to_thread(
-                    gemini_client.models.generate_content,
-                    model=GEMINI_MODEL,
-                    contents=prompt,
-                )
-            except Exception as exc:
-                last_error = exc
-                if not is_transient_gemini_error(exc) or attempt >= 3:
-                    raise
-                # 2s, 4s, 8s. This prevents rapid retry bursts during Gemini overload.
-                await asyncio.sleep(2 ** attempt)
+        # Each member gets an independent task. The semaphore allows all four
+        # TEAM XYZ members to be processed concurrently.
+        for model_index, model in enumerate(models_to_try):
+            for attempt in range(4):
+                try:
+                    return await _gemini_call(model, prompt)
+                except Exception as exc:
+                    last_error = exc
+                    if not is_transient_gemini_error(exc):
+                        raise
+                    if attempt >= 3:
+                        break
+                    # Jitter avoids synchronized retry bursts when Gemini is busy.
+                    delay = min(16.0, (2 ** attempt) + __import__("random").uniform(0.2, 1.0))
+                    await asyncio.sleep(delay)
+
+            # If the primary model is overloaded, try the configured fallback.
+            if model_index < len(models_to_try) - 1:
+                await asyncio.sleep(1.0)
+
         raise last_error or RuntimeError("Gemini request failed")
 
 
@@ -1331,24 +1361,24 @@ USER QUESTION:
         answer = (getattr(response, "text", None) or "").strip()
         if not answer:
             answer = "Gemini returned no text. Please try again."
-        if len(answer) > 1900:
-            answer = answer[:1900] + "…"
 
+        chunks = split_discord_text(answer, 1800)
         await interaction.followup.send(
-            f"🤖 **TEAM XYZ AI — {info['name']}**\n{answer}"
+            f"🤖 **TEAM XYZ AI — {info['name']}**\n{chunks[0]}"
         )
+        for chunk in chunks[1:]:
+            await interaction.followup.send(chunk)
         log_activity(interaction.user.id, "ai", question[:300])
 
     except Exception as exc:
-        error = f"{type(exc).__name__}: {str(exc)[:500]}"
         if is_transient_gemini_error(exc):
             message = (
-                "⚠️ Gemini is temporarily busy/unavailable. "
-                "The bot automatically retried the request. Please try /ai again shortly."
+                "⚠️ Gemini is temporarily busy/unavailable even after automatic retries "
+                "and fallback. Please try /ai again shortly."
             )
         else:
-            message = "❌ Gemini request failed, but the TEAM XYZ bot is still running."
-        await interaction.followup.send(f"{message}\n`{error}`")
+            message = "❌ Gemini request failed, but the TEAM XYZ bot is still running. Please try again."
+        await interaction.followup.send(message)
 
 
 # ============================================================
