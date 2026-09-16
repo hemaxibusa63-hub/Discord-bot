@@ -3,16 +3,26 @@ services:
     name: team-xyz-discord-bot
     runtime: python
     plan: free
+
     buildCommand: pip install -r requirements.txt
-    startCommand: python bot_hosting_webservice_env.py
+
+    startCommand: python bot.py
+
     envVars:
       - key: DISCORD_TOKEN
         sync: false
+
       - key: GEMINI_API_KEY
         sync: false
+
       - key: GEMINI_MODEL
-        value: gemini-3.6-flash
+        value: gemini-2.5-flash
+
       - key: STORAGE_CHANNEL_ID
         sync: false
+
       - key: DB_PATH
         value: team_xyz.db
+
+      - key: AI_MAX_CONCURRENT
+        value: "4"
