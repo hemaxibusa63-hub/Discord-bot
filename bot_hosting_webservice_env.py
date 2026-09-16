@@ -1,8 +1,17 @@
+# ============================================================
+# TEAM XYZ - FREE FIRE ESPORTS DISCORD BOT
+# Clean Final Version
+# Render Web Service + Discord.py + Gemini
+# ============================================================
+
 import os
 import io
+import json
+import time
+import random
 import sqlite3
-import threading
 import asyncio
+import threading
 from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -10,270 +19,364 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-try:
-    from google import genai
-except ImportError:
-    genai = None
-
 # ============================================================
-# TEAM XYZ - FREE FIRE ESPORTS DISCORD BOT
-# Render FREE WEB SERVICE
+# CONFIG
 # ============================================================
 
-BRAND = "TEAM XYZ"
-TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash").strip()
-DB_PATH = os.getenv("DB_PATH", "team_xyz.db").strip() or "team_xyz.db"
 
-try:
-    STORAGE_CHANNEL_ID = int(os.getenv("STORAGE_CHANNEL_ID", "0").strip() or "0")
-except ValueError:
-    STORAGE_CHANNEL_ID = 0
+# Change this from Render Environment Variables if needed.
+GEMINI_MODEL = os.getenv(
+    "GEMINI_MODEL",
+    "gemini-2.5-flash"
+).strip()
+
+DB_PATH = os.getenv("DB_PATH", "team_xyz.db").strip()
+
+# Private Discord channel used as actual file storage.
+STORAGE_CHANNEL_ID = int(
+    os.getenv("STORAGE_CHANNEL_ID", "0") or "0"
+)
+
+PORT = int(os.getenv("PORT", "10000"))
+
+# Maximum simultaneous Gemini calls.
+# Four members can use /ai at the same time.
+AI_MAX_CONCURRENT = int(
+    os.getenv("AI_MAX_CONCURRENT", "4")
+)
+
+AI_RETRIES = 3
+
+# ============================================================
+# TEAM XYZ MEMBERS
+# ============================================================
 
 TEAM = {
-    1549315294856740885: {"name": "Nirav", "role": "IGL + Primary Rusher"},
-    1378993981769252966: {"name": "KRUTIK", "role": "Sniper"},
-    1549303069756624968: {"name": "Dakshit", "role": "Supporter"},
-    1549301330110185533: {"name": "Atul", "role": "Secondary Rusher"},
+    1549315294856740885: {
+        "name": "Nirav",
+        "role": "IGL + Primary Rusher",
+    },
+    1378993981769252966: {
+        "name": "KRUTIK",
+        "role": "Sniper",
+    },
+    1549303069756624968: {
+        "name": "Dakshit",
+        "role": "Supporter",
+    },
+    1549301330110185533: {
+        "name": "Atul",
+        "role": "Secondary Rusher",
+    },
 }
-TEAM_IDS = set(TEAM)
 
-if not TOKEN:
-    raise RuntimeError("DISCORD_TOKEN is missing.")
+
+def is_team_member(user_id: int) -> bool:
+    return user_id in TEAM
+
 
 # ============================================================
 # DATABASE
 # ============================================================
 
-db_lock = threading.RLock()
-db = sqlite3.connect(DB_PATH, check_same_thread=False)
-db.row_factory = sqlite3.Row
+DB_LOCK = threading.RLock()
 
 
-def utcnow():
-    return datetime.now(timezone.utc)
-
-
-def iso(dt=None):
-    return (dt or utcnow()).isoformat()
-
-
-def execute(sql, params=(), fetch=False):
-    with db_lock:
-        cur = db.cursor()
-        cur.execute(sql, params)
-        result = cur.fetchall() if fetch else []
-        db.commit()
-        return result
+def db():
+    conn = sqlite3.connect(
+        DB_PATH,
+        check_same_thread=False
+    )
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 def init_db():
-    tables = [
-        """CREATE TABLE IF NOT EXISTS scrims(
+
+    with DB_LOCK:
+        conn = db()
+        cur = conn.cursor()
+
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS scrims (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            opponent TEXT NOT NULL,
-            scheduled_at TEXT NOT NULL,
-            room_id TEXT DEFAULT '',
-            password TEXT DEFAULT '',
-            map TEXT DEFAULT '',
-            notes TEXT DEFAULT '',
-            result TEXT DEFAULT '',
-            reminder_sent INTEGER DEFAULT 0,
+            opponent TEXT,
+            scheduled_at TEXT,
+            room_id TEXT,
+            password TEXT,
+            map TEXT,
+            notes TEXT,
+            result TEXT,
             created_by INTEGER,
             created_at TEXT
-        )""",
+        )
+        """)
 
-        """CREATE TABLE IF NOT EXISTS tournaments(
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS tournaments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            organizer TEXT DEFAULT '',
-            scheduled_at TEXT DEFAULT '',
-            rounds TEXT DEFAULT '',
-            room_info TEXT DEFAULT '',
-            result TEXT DEFAULT '',
-            placement INTEGER DEFAULT 0,
+            name TEXT,
+            organizer TEXT,
+            scheduled_at TEXT,
+            rounds TEXT,
+            room_info TEXT,
+            result TEXT,
+            placement INTEGER,
             points REAL DEFAULT 0.0,
-            notes TEXT DEFAULT '',
+            notes TEXT,
             created_by INTEGER,
             created_at TEXT
-        )""",
+        )
+        """)
 
-        """CREATE TABLE IF NOT EXISTS matches(
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS matches (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL,
-            opponent TEXT DEFAULT '',
-            match_type TEXT DEFAULT 'scrim',
-            scheduled_at TEXT DEFAULT '',
-            map TEXT DEFAULT '',
-            room_id TEXT DEFAULT '',
-            result TEXT DEFAULT '',
-            notes TEXT DEFAULT '',
+            title TEXT,
+            opponent TEXT,
+            scheduled_at TEXT,
+            map TEXT,
+            placement INTEGER,
+            team_kills INTEGER DEFAULT 0,
+            result TEXT,
+            notes TEXT,
             created_by INTEGER,
             created_at TEXT
-        )""",
+        )
+        """)
 
-        """CREATE TABLE IF NOT EXISTS player_stats(
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS player_stats (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            match_id INTEGER,
-            user_id INTEGER NOT NULL,
+            player_id INTEGER,
             kills INTEGER DEFAULT 0,
             damage REAL DEFAULT 0.0,
             placement INTEGER DEFAULT 0,
             booyah INTEGER DEFAULT 0,
-            survival REAL DEFAULT 0.0,
+            survival_seconds INTEGER DEFAULT 0,
             points REAL DEFAULT 0.0,
-            notes TEXT DEFAULT '',
+            match_name TEXT,
             created_at TEXT
-        )""",
+        )
+        """)
 
-        """CREATE TABLE IF NOT EXISTS strategies(
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS strategies (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            category TEXT NOT NULL,
-            title TEXT NOT NULL,
-            content TEXT NOT NULL,
+            category TEXT,
+            title TEXT,
+            content TEXT,
             created_by INTEGER,
             created_at TEXT
-        )""",
+        )
+        """)
 
-        """CREATE TABLE IF NOT EXISTS training(
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS training (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            category TEXT NOT NULL,
-            goal TEXT NOT NULL,
-            scheduled_at TEXT DEFAULT '',
-            progress TEXT DEFAULT 'Not started',
-            notes TEXT DEFAULT '',
+            category TEXT,
+            title TEXT,
+            goals TEXT,
+            progress TEXT,
+            notes TEXT,
             created_by INTEGER,
             created_at TEXT
-        )""",
+        )
+        """)
 
-        """CREATE TABLE IF NOT EXISTS achievements(
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS achievements (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL,
-            description TEXT DEFAULT '',
-            user_id INTEGER,
-            achieved_at TEXT
-        )""",
+            player_id INTEGER,
+            title TEXT,
+            description TEXT,
+            achieved_at TEXT,
+            created_by INTEGER
+        )
+        """)
 
-        """CREATE TABLE IF NOT EXISTS announcements(
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS announcements (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            content TEXT NOT NULL,
-            scheduled_at TEXT DEFAULT '',
-            channel_id INTEGER,
+            content TEXT,
+            scheduled_at TEXT,
             sent INTEGER DEFAULT 0,
             created_by INTEGER,
             created_at TEXT
-        )""",
+        )
+        """)
 
-        """CREATE TABLE IF NOT EXISTS files(
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS files (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            file_name TEXT NOT NULL,
-            file_type TEXT DEFAULT '',
-            file_size INTEGER DEFAULT 0,
+            filename TEXT,
+            content_type TEXT,
+            size INTEGER,
             uploader_id INTEGER,
-            uploaded_at TEXT,
             storage_channel_id INTEGER,
             storage_message_id INTEGER,
-            storage_url TEXT DEFAULT ''
-        )""",
-
-        """CREATE TABLE IF NOT EXISTS chat_context(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            content TEXT NOT NULL,
-            channel_id INTEGER,
-            message_id INTEGER,
+            storage_url TEXT,
             created_at TEXT
-        )""",
+        )
+        """)
 
-        """CREATE TABLE IF NOT EXISTS activity(
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS chat_context (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            action TEXT NOT NULL,
-            details TEXT DEFAULT '',
+            author_id INTEGER,
+            content TEXT,
             created_at TEXT
-        )""",
-    ]
+        )
+        """)
 
-    for table in tables:
-        execute(table)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS activity (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            action TEXT,
+            created_at TEXT
+        )
+        """)
 
-
-def log_activity(user_id, action, details=""):
-    execute(
-        """INSERT INTO activity(user_id,action,details,created_at)
-           VALUES(?,?,?,?)""",
-        (user_id, action, str(details)[:2000], iso()),
-    )
-
-
-def parse_datetime(value):
-    value = value.strip()
-    if value.endswith("Z"):
-        value = value[:-1] + "+00:00"
-    dt = datetime.fromisoformat(value)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+        conn.commit()
+        conn.close()
 
 
-def member_info(user_id):
-    return TEAM.get(user_id)
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
 
 
-def member_text(user_id):
-    info = TEAM.get(user_id)
-    if not info:
-        return str(user_id)
-    return f"{info['name']} ({info['role']})"
+def log_activity(user_id, action):
+
+    with DB_LOCK:
+        conn = db()
+        conn.execute(
+            """
+            INSERT INTO activity
+            (user_id, action, created_at)
+            VALUES (?, ?, ?)
+            """,
+            (user_id, action, now_iso())
+        )
+        conn.commit()
+        conn.close()
 
 
 # ============================================================
-# DISCORD
+# DISCORD BOT
 # ============================================================
 
 intents = discord.Intents.default()
+
+intents.guilds = True
 intents.members = True
 intents.message_content = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
-tree = bot.tree
+bot = commands.Bot(
+    command_prefix="!",
+    intents=intents
+)
 
-gemini_client = None
-
-if GEMINI_API_KEY and genai is not None:
-    try:
-        gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-    except Exception as exc:
-        print("Gemini initialization error:", exc)
+ai_semaphore = asyncio.Semaphore(
+    AI_MAX_CONCURRENT
+)
 
 
-async def team_check(interaction: discord.Interaction):
-    if interaction.user.id not in TEAM_IDS:
-        raise app_commands.CheckFailure(
-            "Only TEAM XYZ members can use this bot."
-        )
-    return True
+# ============================================================
+# HELPERS
+# ============================================================
+
+async def send_long(destination, text, *, ephemeral=False):
+
+    if not text:
+        return
+
+    text = str(text)
+
+    chunks = []
+
+    while len(text) > 1900:
+        cut = text.rfind("\n", 0, 1900)
+
+        if cut < 500:
+            cut = 1900
+
+        chunks.append(text[:cut])
+        text = text[cut:].lstrip()
+
+    if text:
+        chunks.append(text)
+
+    for i, chunk in enumerate(chunks):
+
+        if isinstance(destination, discord.Interaction):
+
+            if i == 0:
+                if destination.response.is_done():
+                    await destination.followup.send(
+                        chunk,
+                        ephemeral=ephemeral
+                    )
+                else:
+                    await destination.response.send_message(
+                        chunk,
+                        ephemeral=ephemeral
+                    )
+            else:
+                await destination.followup.send(
+                    chunk,
+                    ephemeral=ephemeral
+                )
+
+        else:
+            await destination.send(chunk)
 
 
 def team_only():
-    return app_commands.check(team_check)
+    async def predicate(interaction: discord.Interaction):
 
+        if not is_team_member(interaction.user.id):
+            raise app_commands.CheckFailure(
+                "TEAM XYZ members only."
+            )
+
+        return True
+
+    return app_commands.check(predicate)
+
+
+def member_info(user_id):
+
+    return TEAM.get(
+        user_id,
+        {
+            "name": "Unknown",
+            "role": "Team Member"
+        }
+    )
+
+
+# ============================================================
+# READY
+# ============================================================
 
 @bot.event
 async def on_ready():
-    print("=" * 50)
-    print(f"{BRAND} ONLINE")
-    print(f"Discord user: {bot.user}")
+
+    print("=" * 60)
+    print("TEAM XYZ BOT ONLINE")
+    print(f"Logged in as: {bot.user}")
     print(f"Gemini model: {GEMINI_MODEL}")
-    print(f"Storage channel: {STORAGE_CHANNEL_ID or 'NOT SET'}")
-    print("=" * 50)
+    print(f"AI concurrent slots: {AI_MAX_CONCURRENT}")
+    print("=" * 60)
 
     try:
-        synced = await tree.sync()
+        synced = await bot.tree.sync()
         print(f"Synced {len(synced)} slash commands.")
-    except Exception as exc:
-        print("Slash command sync error:", exc)
+    except Exception as e:
+        print("Slash command sync error:", repr(e))
 
     if not reminder_loop.is_running():
         reminder_loop.start()
@@ -282,205 +385,340 @@ async def on_ready():
         announcement_loop.start()
 
 
+# ============================================================
+# MESSAGE CONTEXT + FILE STORAGE
+# ============================================================
+
 @bot.event
-async def on_message(message: discord.Message):
+async def on_message(message):
+
     if message.author.bot:
         return
 
-    if message.author.id in TEAM_IDS:
-        if message.attachments:
-            await save_attachments(message)
+    if not is_team_member(message.author.id):
+        return
 
-        if message.content.strip():
-            execute(
-                """INSERT INTO chat_context
-                   (user_id,content,channel_id,message_id,created_at)
-                   VALUES(?,?,?,?,?)""",
+    # Save only short/relevant team chat context.
+    content = (message.content or "").strip()
+
+    if content:
+        content = content[:1500]
+
+        with DB_LOCK:
+            conn = db()
+
+            conn.execute(
+                """
+                INSERT INTO chat_context
+                (author_id, content, created_at)
+                VALUES (?, ?, ?)
+                """,
                 (
                     message.author.id,
-                    message.content[:4000],
-                    message.channel.id,
-                    message.id,
-                    iso(),
-                ),
+                    content,
+                    now_iso()
+                )
             )
+
+            # Keep database small.
+            conn.execute("""
+                DELETE FROM chat_context
+                WHERE id NOT IN (
+                    SELECT id
+                    FROM chat_context
+                    ORDER BY id DESC
+                    LIMIT 200
+                )
+            """)
+
+            conn.commit()
+            conn.close()
+
+    # Store attachments in private Discord storage channel.
+    if message.attachments:
+
+        await store_message_attachments(message)
 
     await bot.process_commands(message)
 
 
-# ============================================================
-# HELP
-# ============================================================
+async def store_message_attachments(message):
 
-@tree.command(name="help", description="Show TEAM XYZ bot commands")
-@team_only()
-async def help_command(interaction: discord.Interaction):
-    text = f"""🔥 **{BRAND} — FREE FIRE ESPORTS BOT**
-
-👥 `/team`
-⚔️ `/scrim_create`
-⚔️ `/scrims`
-⚔️ `/scrim_result`
-
-🏆 `/tournament_create`
-🏆 `/tournaments`
-🏆 `/tournament_result`
-
-🎯 `/match_create`
-🎯 `/matches`
-
-📊 `/stat_add`
-📊 `/stats`
-📊 `/player_stats`
-
-🧠 `/strategy_add`
-🧠 `/strategies`
-
-🏋️ `/training_add`
-🏋️ `/training`
-
-🏅 `/achievement_add`
-🏅 `/achievements`
-
-📢 `/announce`
-
-📁 `/files`
-
-📈 `/dashboard`
-🕒 `/activity`
-
-🤖 `/ai`
-
-All 4 TEAM XYZ members have equal/full access.
-No owner panel."""
-    await interaction.response.send_message(text, ephemeral=True)
-
-
-# ============================================================
-# TEAM
-# ============================================================
-
-@tree.command(name="team", description="Show TEAM XYZ roster")
-@team_only()
-async def team_command(interaction: discord.Interaction):
-    lines = ["🔥 **TEAM XYZ ROSTER**", ""]
-    for uid, info in TEAM.items():
-        lines.append(
-            f"• **{info['name']}** — {info['role']} — <@{uid}>"
+    if not STORAGE_CHANNEL_ID:
+        print(
+            "STORAGE_CHANNEL_ID not configured; "
+            "attachments were not copied."
         )
-    await interaction.response.send_message("\n".join(lines))
+        return
+
+    channel = bot.get_channel(STORAGE_CHANNEL_ID)
+
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(
+                STORAGE_CHANNEL_ID
+            )
+        except Exception as e:
+            print("Storage channel error:", repr(e))
+            return
+
+    for attachment in message.attachments:
+
+        try:
+            data = await attachment.read()
+
+            file_obj = discord.File(
+                io.BytesIO(data),
+                filename=attachment.filename
+            )
+
+            storage_message = await channel.send(
+                content=(
+                    f"📁 **TEAM XYZ FILE**\n"
+                    f"Uploader: {message.author.mention}\n"
+                    f"Original message: {message.id}\n"
+                    f"File: `{attachment.filename}`"
+                ),
+                file=file_obj
+            )
+
+            with DB_LOCK:
+                conn = db()
+
+                conn.execute(
+                    """
+                    INSERT INTO files
+                    (
+                        filename,
+                        content_type,
+                        size,
+                        uploader_id,
+                        storage_channel_id,
+                        storage_message_id,
+                        storage_url,
+                        created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        attachment.filename,
+                        attachment.content_type or "",
+                        attachment.size,
+                        message.author.id,
+                        STORAGE_CHANNEL_ID,
+                        storage_message.id,
+                        storage_message.jump_url,
+                        now_iso()
+                    )
+                )
+
+                conn.commit()
+                conn.close()
+
+            log_activity(
+                message.author.id,
+                f"Uploaded file: {attachment.filename}"
+            )
+
+        except Exception as e:
+            print(
+                f"Attachment storage error "
+                f"{attachment.filename}: {repr(e)}"
+            )
+
+
+# ============================================================
+# /TEAM
+# ============================================================
+
+@bot.tree.command(
+    name="team",
+    description="Show TEAM XYZ roster"
+)
+@team_only()
+async def team(interaction: discord.Interaction):
+
+    lines = [
+        "🔥 **TEAM XYZ — FREE FIRE ESPORTS**",
+        ""
+    ]
+
+    for user_id, info in TEAM.items():
+
+        lines.append(
+            f"👤 **{info['name']}**\n"
+            f"Role: {info['role']}\n"
+            f"Discord ID: `{user_id}`\n"
+        )
+
+    await send_long(
+        interaction,
+        "\n".join(lines)
+    )
 
 
 # ============================================================
 # SCRIMS
 # ============================================================
 
-@tree.command(name="scrim_create", description="Create a scrim")
+@bot.tree.command(
+    name="scrim_create",
+    description="Create a scrim"
+)
 @app_commands.describe(
-    opponent="Opponent/team",
-    scheduled_at="UTC ISO time, e.g. 2026-09-20T18:30:00+00:00",
+    opponent="Opponent team",
+    scheduled_at="UTC date/time e.g. 2026-09-20 18:30",
     room_id="Room ID",
     password="Room password",
-    map="Map",
-    notes="Notes",
+    map_name="Map",
+    notes="Notes"
 )
 @team_only()
 async def scrim_create(
-    interaction: discord.Interaction,
+    interaction,
     opponent: str,
     scheduled_at: str,
     room_id: str = "",
     password: str = "",
-    map: str = "",
-    notes: str = "",
+    map_name: str = "Bermuda",
+    notes: str = ""
 ):
-    try:
-        dt = parse_datetime(scheduled_at)
-    except Exception:
-        await interaction.response.send_message(
-            "❌ Invalid time. Use ISO format.",
-            ephemeral=True,
+
+    with DB_LOCK:
+        conn = db()
+
+        conn.execute(
+            """
+            INSERT INTO scrims
+            (
+                opponent,
+                scheduled_at,
+                room_id,
+                password,
+                map,
+                notes,
+                created_by,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                opponent,
+                scheduled_at,
+                room_id,
+                password,
+                map_name,
+                notes,
+                interaction.user.id,
+                now_iso()
+            )
         )
-        return
 
-    execute(
-        """INSERT INTO scrims
-           (opponent,scheduled_at,room_id,password,map,notes,created_by,created_at)
-           VALUES(?,?,?,?,?,?,?,?)""",
-        (
-            opponent,
-            dt.isoformat(),
-            room_id,
-            password,
-            map,
-            notes,
-            interaction.user.id,
-            iso(),
-        ),
+        conn.commit()
+        conn.close()
+
+    log_activity(
+        interaction.user.id,
+        f"Created scrim vs {opponent}"
     )
-
-    log_activity(interaction.user.id, "scrim_create", opponent)
 
     await interaction.response.send_message(
         f"⚔️ **Scrim created**\n"
         f"Opponent: **{opponent}**\n"
-        f"Time UTC: `{dt.isoformat()}`\n"
-        f"Map: `{map or '-'}`\n"
-        f"Room: `{room_id or '-'}`"
+        f"Time: **{scheduled_at}**\n"
+        f"Map: **{map_name}**\n"
+        f"Room: `{room_id or 'Not set'}`"
     )
 
 
-@tree.command(name="scrims", description="Show scrims")
+@bot.tree.command(
+    name="scrims",
+    description="Show scrims"
+)
 @team_only()
-async def scrims_command(interaction: discord.Interaction):
-    rows = execute(
-        "SELECT * FROM scrims ORDER BY scheduled_at ASC LIMIT 20",
-        fetch=True,
-    )
+async def scrims(interaction):
 
-    if not rows:
-        await interaction.response.send_message("⚔️ No scrims found.")
-        return
+    with DB_LOCK:
+        conn = db()
 
-    lines = ["⚔️ **SCRIMS**", ""]
-    for row in rows:
-        lines.append(
-            f"**#{row['id']} {row['opponent']}**\n"
-            f"Time: `{row['scheduled_at']}`\n"
-            f"Map: `{row['map'] or '-'}` | Room: `{row['room_id'] or '-'}`\n"
-            f"Result: `{row['result'] or 'Pending'}`"
-        )
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM scrims
+            ORDER BY id DESC
+            LIMIT 20
+            """
+        ).fetchall()
 
-    await interaction.response.send_message("\n".join(lines))
-
-
-@tree.command(name="scrim_result", description="Update scrim result")
-@team_only()
-async def scrim_result(
-    interaction: discord.Interaction,
-    scrim_id: int,
-    result: str,
-):
-    rows = execute(
-        "SELECT id FROM scrims WHERE id=?",
-        (scrim_id,),
-        fetch=True,
-    )
+        conn.close()
 
     if not rows:
         await interaction.response.send_message(
-            "❌ Scrim not found.",
-            ephemeral=True,
+            "⚔️ No scrims found."
         )
         return
 
-    execute(
-        "UPDATE scrims SET result=?, reminder_sent=1 WHERE id=?",
-        (result, scrim_id),
+    lines = ["⚔️ **TEAM XYZ SCRIMS**", ""]
+
+    for r in rows:
+
+        lines.append(
+            f"**#{r['id']} — {r['opponent']}**\n"
+            f"🕒 {r['scheduled_at']}\n"
+            f"🗺️ {r['map']}\n"
+            f"🏠 Room: `{r['room_id'] or 'N/A'}`\n"
+            f"📌 Result: {r['result'] or 'Pending'}\n"
+        )
+
+    await send_long(
+        interaction,
+        "\n".join(lines)
+    )
+
+
+@bot.tree.command(
+    name="scrim_result",
+    description="Update scrim result"
+)
+@app_commands.describe(
+    scrim_id="Scrim ID",
+    result="Result"
+)
+@team_only()
+async def scrim_result(
+    interaction,
+    scrim_id: int,
+    result: str
+):
+
+    with DB_LOCK:
+        conn = db()
+
+        cur = conn.execute(
+            """
+            UPDATE scrims
+            SET result=?
+            WHERE id=?
+            """,
+            (result, scrim_id)
+        )
+
+        conn.commit()
+        conn.close()
+
+    if cur.rowcount == 0:
+        await interaction.response.send_message(
+            "❌ Scrim not found."
+        )
+        return
+
+    log_activity(
+        interaction.user.id,
+        f"Updated scrim #{scrim_id}"
     )
 
     await interaction.response.send_message(
-        f"✅ Scrim **#{scrim_id}** result updated: **{result}**"
+        f"✅ Scrim #{scrim_id} result updated: **{result}**"
     )
 
 
@@ -488,107 +726,162 @@ async def scrim_result(
 # TOURNAMENTS
 # ============================================================
 
-@tree.command(name="tournament_create", description="Create tournament")
+@bot.tree.command(
+    name="tournament_create",
+    description="Create tournament"
+)
+@app_commands.describe(
+    name="Tournament name",
+    organizer="Organizer",
+    scheduled_at="UTC date/time",
+    rounds="Rounds",
+    room_info="Room information",
+    notes="Notes"
+)
 @team_only()
 async def tournament_create(
-    interaction: discord.Interaction,
+    interaction,
     name: str,
-    organizer: str = "",
-    scheduled_at: str = "",
+    organizer: str,
+    scheduled_at: str,
     rounds: str = "",
     room_info: str = "",
-    notes: str = "",
+    notes: str = ""
 ):
-    if scheduled_at:
-        try:
-            scheduled_at = parse_datetime(scheduled_at).isoformat()
-        except Exception:
-            await interaction.response.send_message(
-                "❌ Invalid time.",
-                ephemeral=True,
+
+    with DB_LOCK:
+        conn = db()
+
+        conn.execute(
+            """
+            INSERT INTO tournaments
+            (
+                name,
+                organizer,
+                scheduled_at,
+                rounds,
+                room_info,
+                notes,
+                created_by,
+                created_at
             )
-            return
-
-    execute(
-        """INSERT INTO tournaments
-           (name,organizer,scheduled_at,rounds,room_info,notes,created_by,created_at)
-           VALUES(?,?,?,?,?,?,?,?)""",
-        (
-            name,
-            organizer,
-            scheduled_at,
-            rounds,
-            room_info,
-            notes,
-            interaction.user.id,
-            iso(),
-        ),
-    )
-
-    await interaction.response.send_message(
-        f"🏆 Tournament **{name}** created."
-    )
-
-
-@tree.command(name="tournaments", description="Show tournaments")
-@team_only()
-async def tournaments_command(interaction: discord.Interaction):
-    rows = execute(
-        "SELECT * FROM tournaments ORDER BY id DESC LIMIT 20",
-        fetch=True,
-    )
-
-    if not rows:
-        await interaction.response.send_message("🏆 No tournaments.")
-        return
-
-    lines = ["🏆 **TOURNAMENTS**", ""]
-    for row in rows:
-        lines.append(
-            f"**#{row['id']} {row['name']}**\n"
-            f"Organizer: `{row['organizer'] or '-'}`\n"
-            f"Time: `{row['scheduled_at'] or '-'}`\n"
-            f"Placement: `{row['placement'] or '-'}` | "
-            f"Points: `{row['points']:.1f}`\n"
-            f"Result: `{row['result'] or 'Pending'}`"
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                name,
+                organizer,
+                scheduled_at,
+                rounds,
+                room_info,
+                notes,
+                interaction.user.id,
+                now_iso()
+            )
         )
 
-    await interaction.response.send_message("\n".join(lines))
+        conn.commit()
+        conn.close()
 
-
-@tree.command(name="tournament_result", description="Update tournament result")
-@team_only()
-async def tournament_result(
-    interaction: discord.Interaction,
-    tournament_id: int,
-    result: str = "",
-    placement: int = 0,
-    points: float = 0.0,
-):
-    rows = execute(
-        "SELECT id FROM tournaments WHERE id=?",
-        (tournament_id,),
-        fetch=True,
+    await interaction.response.send_message(
+        f"🏆 **Tournament created**\n"
+        f"Name: **{name}**\n"
+        f"Organizer: {organizer}\n"
+        f"Time: {scheduled_at}"
     )
+
+
+@bot.tree.command(
+    name="tournaments",
+    description="Show tournaments"
+)
+@team_only()
+async def tournaments(interaction):
+
+    with DB_LOCK:
+        conn = db()
+
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM tournaments
+            ORDER BY id DESC
+            LIMIT 15
+            """
+        ).fetchall()
+
+        conn.close()
 
     if not rows:
         await interaction.response.send_message(
-            "❌ Tournament not found.",
-            ephemeral=True,
+            "🏆 No tournaments found."
         )
         return
 
-    execute(
-        """UPDATE tournaments
-           SET result=?, placement=?, points=?
-           WHERE id=?""",
-        (result, placement, points, tournament_id),
+    lines = ["🏆 **TEAM XYZ TOURNAMENTS**", ""]
+
+    for r in rows:
+
+        lines.append(
+            f"**#{r['id']} — {r['name']}**\n"
+            f"👤 Organizer: {r['organizer']}\n"
+            f"🕒 {r['scheduled_at']}\n"
+            f"🏅 Placement: {r['placement'] or 'Pending'}\n"
+            f"⭐ Points: {r['points']}\n"
+            f"📌 Result: {r['result'] or 'Pending'}\n"
+        )
+
+    await send_long(
+        interaction,
+        "\n".join(lines)
     )
 
+
+@bot.tree.command(
+    name="tournament_result",
+    description="Update tournament result"
+)
+@team_only()
+async def tournament_result(
+    interaction,
+    tournament_id: int,
+    placement: int,
+    points: float,
+    result: str
+):
+
+    with DB_LOCK:
+        conn = db()
+
+        cur = conn.execute(
+            """
+            UPDATE tournaments
+            SET placement=?,
+                points=?,
+                result=?
+            WHERE id=?
+            """,
+            (
+                placement,
+                points,
+                result,
+                tournament_id
+            )
+        )
+
+        conn.commit()
+        conn.close()
+
+    if cur.rowcount == 0:
+        await interaction.response.send_message(
+            "❌ Tournament not found."
+        )
+        return
+
     await interaction.response.send_message(
-        f"✅ Tournament **#{tournament_id}** updated.\n"
-        f"Placement: **{placement}**\n"
-        f"Points: **{points:.1f}**"
+        f"🏆 Tournament updated\n"
+        f"Placement: **#{placement}**\n"
+        f"Points: **{points}**\n"
+        f"Result: **{result}**"
     )
 
 
@@ -596,207 +889,272 @@ async def tournament_result(
 # MATCHES
 # ============================================================
 
-@tree.command(name="match_create", description="Create match")
+@bot.tree.command(
+    name="match_create",
+    description="Create match"
+)
 @team_only()
 async def match_create(
-    interaction: discord.Interaction,
+    interaction,
     title: str,
-    opponent: str = "",
-    match_type: str = "scrim",
-    scheduled_at: str = "",
-    map: str = "",
-    room_id: str = "",
-    notes: str = "",
+    opponent: str,
+    scheduled_at: str,
+    map_name: str = "Bermuda",
+    notes: str = ""
 ):
-    if scheduled_at:
-        try:
-            scheduled_at = parse_datetime(scheduled_at).isoformat()
-        except Exception:
-            await interaction.response.send_message(
-                "❌ Invalid time.",
-                ephemeral=True,
+
+    with DB_LOCK:
+        conn = db()
+
+        conn.execute(
+            """
+            INSERT INTO matches
+            (
+                title,
+                opponent,
+                scheduled_at,
+                map,
+                notes,
+                created_by,
+                created_at
             )
-            return
-
-    execute(
-        """INSERT INTO matches
-           (title,opponent,match_type,scheduled_at,map,room_id,notes,created_by,created_at)
-           VALUES(?,?,?,?,?,?,?,?,?)""",
-        (
-            title,
-            opponent,
-            match_type,
-            scheduled_at,
-            map,
-            room_id,
-            notes,
-            interaction.user.id,
-            iso(),
-        ),
-    )
-
-    await interaction.response.send_message(
-        f"🎯 Match **{title}** created."
-    )
-
-
-@tree.command(name="matches", description="Show matches")
-@team_only()
-async def matches_command(interaction: discord.Interaction):
-    rows = execute(
-        "SELECT * FROM matches ORDER BY id DESC LIMIT 25",
-        fetch=True,
-    )
-
-    if not rows:
-        await interaction.response.send_message("🎯 No matches.")
-        return
-
-    lines = ["🎯 **MATCHES**", ""]
-    for row in rows:
-        lines.append(
-            f"**#{row['id']} {row['title']}**\n"
-            f"Type: `{row['match_type']}` | Opponent: `{row['opponent'] or '-'}`\n"
-            f"Time: `{row['scheduled_at'] or '-'}`\n"
-            f"Result: `{row['result'] or 'Pending'}`"
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                title,
+                opponent,
+                scheduled_at,
+                map_name,
+                notes,
+                interaction.user.id,
+                now_iso()
+            )
         )
 
-    await interaction.response.send_message("\n".join(lines))
+        conn.commit()
+        conn.close()
+
+    await interaction.response.send_message(
+        f"🎯 **Match created**\n"
+        f"Match: **{title}**\n"
+        f"Opponent: **{opponent}**\n"
+        f"Time: {scheduled_at}\n"
+        f"Map: {map_name}"
+    )
+
+
+@bot.tree.command(
+    name="matches",
+    description="Show matches"
+)
+@team_only()
+async def matches(interaction):
+
+    with DB_LOCK:
+        conn = db()
+
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM matches
+            ORDER BY id DESC
+            LIMIT 20
+            """
+        ).fetchall()
+
+        conn.close()
+
+    if not rows:
+        await interaction.response.send_message(
+            "🎯 No matches found."
+        )
+        return
+
+    lines = ["🎯 **TEAM XYZ MATCHES**", ""]
+
+    for r in rows:
+
+        lines.append(
+            f"**#{r['id']} — {r['title']}**\n"
+            f"Opponent: {r['opponent']}\n"
+            f"Time: {r['scheduled_at']}\n"
+            f"Map: {r['map']}\n"
+            f"Kills: {r['team_kills']}\n"
+            f"Placement: {r['placement'] or 'Pending'}\n"
+        )
+
+    await send_long(
+        interaction,
+        "\n".join(lines)
+    )
 
 
 # ============================================================
 # PLAYER STATS
 # ============================================================
 
-@tree.command(name="stat_add", description="Add player match stats")
+@bot.tree.command(
+    name="stat_add",
+    description="Add player statistics"
+)
 @team_only()
 async def stat_add(
-    interaction: discord.Interaction,
-    user: discord.User,
-    kills: int = 0,
-    damage: float = 0.0,
-    placement: int = 0,
+    interaction,
+    player: discord.Member,
+    kills: int,
+    damage: float,
+    placement: int,
     booyah: int = 0,
-    survival: float = 0.0,
+    survival_seconds: int = 0,
     points: float = 0.0,
-    match_id: int = 0,
-    notes: str = "",
+    match_name: str = ""
 ):
-    if user.id not in TEAM_IDS:
+
+    if player.id not in TEAM:
         await interaction.response.send_message(
-            "❌ User is not a TEAM XYZ member.",
-            ephemeral=True,
+            "❌ Player is not a TEAM XYZ member."
         )
         return
 
-    if match_id:
-        rows = execute(
-            "SELECT id FROM matches WHERE id=?",
-            (match_id,),
-            fetch=True,
-        )
-        if not rows:
-            await interaction.response.send_message(
-                "❌ Match not found.",
-                ephemeral=True,
+    with DB_LOCK:
+        conn = db()
+
+        conn.execute(
+            """
+            INSERT INTO player_stats
+            (
+                player_id,
+                kills,
+                damage,
+                placement,
+                booyah,
+                survival_seconds,
+                points,
+                match_name,
+                created_at
             )
-            return
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                player.id,
+                kills,
+                damage,
+                placement,
+                booyah,
+                survival_seconds,
+                points,
+                match_name,
+                now_iso()
+            )
+        )
 
-    execute(
-        """INSERT INTO player_stats
-           (match_id,user_id,kills,damage,placement,booyah,
-            survival,points,notes,created_at)
-           VALUES(?,?,?,?,?,?,?,?,?,?)""",
-        (
-            match_id or None,
-            user.id,
-            kills,
-            damage,
-            placement,
-            booyah,
-            survival,
-            points,
-            notes,
-            iso(),
-        ),
-    )
+        conn.commit()
+        conn.close()
 
     await interaction.response.send_message(
-        f"📊 Stats saved for **{TEAM[user.id]['name']}**\n"
-        f"Kills: `{kills}` | Damage: `{damage:.1f}` | "
-        f"Points: `{points:.1f}`"
+        f"📊 Stats added for **{player.display_name}**\n"
+        f"Kills: {kills}\n"
+        f"Damage: {damage}\n"
+        f"Placement: #{placement}\n"
+        f"Booyah: {booyah}\n"
+        f"Points: {points}"
     )
 
 
-@tree.command(name="stats", description="Show team stats")
+@bot.tree.command(
+    name="stats",
+    description="Show team statistics"
+)
 @team_only()
-async def stats_command(interaction: discord.Interaction):
-    rows = execute(
-        """SELECT user_id,
-                  COUNT(*) games,
-                  COALESCE(SUM(kills),0) kills,
-                  COALESCE(SUM(damage),0) damage,
-                  COALESCE(SUM(booyah),0) booyah,
-                  COALESCE(SUM(points),0) points
-           FROM player_stats
-           GROUP BY user_id
-           ORDER BY points DESC""",
-        fetch=True,
-    )
+async def stats(interaction):
 
-    if not rows:
-        await interaction.response.send_message("📊 No stats yet.")
-        return
+    with DB_LOCK:
+        conn = db()
 
-    lines = ["📊 **TEAM STATS**", ""]
-    for row in rows:
-        if row["user_id"] not in TEAM:
-            continue
-        info = TEAM[row["user_id"]]
+        rows = conn.execute(
+            """
+            SELECT
+                player_id,
+                SUM(kills) AS kills,
+                SUM(damage) AS damage,
+                SUM(booyah) AS booyah,
+                SUM(points) AS points,
+                COUNT(*) AS games
+            FROM player_stats
+            GROUP BY player_id
+            """
+        ).fetchall()
+
+        conn.close()
+
+    lines = ["📊 **TEAM XYZ STATISTICS**", ""]
+
+    for r in rows:
+
+        info = member_info(r["player_id"])
+
         lines.append(
-            f"**{info['name']}** — {info['role']}\n"
-            f"Games: `{row['games']}` | Kills: `{row['kills']}` | "
-            f"Damage: `{row['damage']:.1f}` | "
-            f"Booyah: `{row['booyah']}` | Points: `{row['points']:.1f}`"
+            f"👤 **{info['name']}** — {info['role']}\n"
+            f"Games: {r['games']}\n"
+            f"Kills: {r['kills'] or 0}\n"
+            f"Damage: {round(r['damage'] or 0, 1)}\n"
+            f"Booyah: {r['booyah'] or 0}\n"
+            f"Points: {round(r['points'] or 0, 1)}\n"
         )
 
-    await interaction.response.send_message("\n".join(lines))
+    if len(lines) == 2:
+        lines.append("No statistics yet.")
+
+    await send_long(
+        interaction,
+        "\n".join(lines)
+    )
 
 
-@tree.command(name="player_stats", description="Show player stats")
+@bot.tree.command(
+    name="player_stats",
+    description="Show one player's statistics"
+)
 @team_only()
-async def player_stats_command(
-    interaction: discord.Interaction,
-    user: discord.User,
+async def player_stats(
+    interaction,
+    player: discord.Member
 ):
-    if user.id not in TEAM_IDS:
+
+    if player.id not in TEAM:
         await interaction.response.send_message(
-            "❌ Not a TEAM XYZ member.",
-            ephemeral=True,
+            "❌ TEAM XYZ member only."
         )
         return
 
-    rows = execute(
-        """SELECT COUNT(*) games,
-                  COALESCE(SUM(kills),0) kills,
-                  COALESCE(SUM(damage),0) damage,
-                  COALESCE(SUM(booyah),0) booyah,
-                  COALESCE(SUM(points),0) points
-           FROM player_stats WHERE user_id=?""",
-        (user.id,),
-        fetch=True,
-    )
+    with DB_LOCK:
+        conn = db()
 
-    row = rows[0]
-    info = TEAM[user.id]
+        r = conn.execute(
+            """
+            SELECT
+                SUM(kills) AS kills,
+                SUM(damage) AS damage,
+                SUM(booyah) AS booyah,
+                SUM(points) AS points,
+                COUNT(*) AS games
+            FROM player_stats
+            WHERE player_id=?
+            """,
+            (player.id,)
+        ).fetchone()
+
+        conn.close()
+
+    info = member_info(player.id)
 
     await interaction.response.send_message(
-        f"📊 **{info['name']} — {info['role']}**\n"
-        f"Games: `{row['games']}`\n"
-        f"Kills: `{row['kills']}`\n"
-        f"Damage: `{row['damage']:.1f}`\n"
-        f"Booyah: `{row['booyah']}`\n"
-        f"Points: `{row['points']:.1f}`"
+        f"📊 **{info['name']} — {info['role']}**\n\n"
+        f"Games: {r['games'] or 0}\n"
+        f"Kills: {r['kills'] or 0}\n"
+        f"Damage: {round(r['damage'] or 0, 1)}\n"
+        f"Booyah: {r['booyah'] or 0}\n"
+        f"Points: {round(r['points'] or 0, 1)}"
     )
 
 
@@ -804,762 +1162,1123 @@ async def player_stats_command(
 # STRATEGY
 # ============================================================
 
-@tree.command(name="strategy_add", description="Save strategy")
+@bot.tree.command(
+    name="strategy_add",
+    description="Add strategy"
+)
 @team_only()
 async def strategy_add(
-    interaction: discord.Interaction,
+    interaction,
     category: str,
     title: str,
-    content: str,
+    content: str
 ):
-    execute(
-        """INSERT INTO strategies
-           (category,title,content,created_by,created_at)
-           VALUES(?,?,?,?,?)""",
-        (
-            category,
-            title,
-            content,
-            interaction.user.id,
-            iso(),
-        ),
-    )
 
-    await interaction.response.send_message(
-        f"🧠 Strategy **{title}** saved."
-    )
+    with DB_LOCK:
+        conn = db()
 
-
-@tree.command(name="strategies", description="Show strategies")
-@team_only()
-async def strategies_command(interaction: discord.Interaction):
-    rows = execute(
-        "SELECT * FROM strategies ORDER BY id DESC LIMIT 25",
-        fetch=True,
-    )
-
-    if not rows:
-        await interaction.response.send_message("🧠 No strategies.")
-        return
-
-    lines = ["🧠 **TEAM STRATEGIES**", ""]
-    for row in rows:
-        lines.append(
-            f"**#{row['id']} {row['title']}** [{row['category']}]\n"
-            f"{row['content'][:700]}"
+        conn.execute(
+            """
+            INSERT INTO strategies
+            (
+                category,
+                title,
+                content,
+                created_by,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                category,
+                title,
+                content,
+                interaction.user.id,
+                now_iso()
+            )
         )
 
-    await interaction.response.send_message("\n".join(lines))
+        conn.commit()
+        conn.close()
+
+    await interaction.response.send_message(
+        f"🧠 Strategy saved: **{title}**"
+    )
+
+
+@bot.tree.command(
+    name="strategies",
+    description="Show strategies"
+)
+@team_only()
+async def strategies(interaction):
+
+    with DB_LOCK:
+        conn = db()
+
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM strategies
+            ORDER BY id DESC
+            LIMIT 15
+            """
+        ).fetchall()
+
+        conn.close()
+
+    lines = ["🧠 **TEAM XYZ STRATEGIES**", ""]
+
+    for r in rows:
+
+        lines.append(
+            f"**{r['title']}**\n"
+            f"Category: {r['category']}\n"
+            f"{r['content']}\n"
+        )
+
+    if len(lines) == 2:
+        lines.append("No strategies yet.")
+
+    await send_long(
+        interaction,
+        "\n".join(lines)
+    )
 
 
 # ============================================================
 # TRAINING
 # ============================================================
 
-@tree.command(name="training_add", description="Create training plan")
+@bot.tree.command(
+    name="training_add",
+    description="Add training plan"
+)
 @team_only()
 async def training_add(
-    interaction: discord.Interaction,
+    interaction,
     category: str,
-    goal: str,
-    scheduled_at: str = "",
+    title: str,
+    goals: str,
     progress: str = "Not started",
-    notes: str = "",
+    notes: str = ""
 ):
-    if scheduled_at:
-        try:
-            scheduled_at = parse_datetime(scheduled_at).isoformat()
-        except Exception:
-            await interaction.response.send_message(
-                "❌ Invalid time.",
-                ephemeral=True,
+
+    with DB_LOCK:
+        conn = db()
+
+        conn.execute(
+            """
+            INSERT INTO training
+            (
+                category,
+                title,
+                goals,
+                progress,
+                notes,
+                created_by,
+                created_at
             )
-            return
-
-    execute(
-        """INSERT INTO training
-           (category,goal,scheduled_at,progress,notes,created_by,created_at)
-           VALUES(?,?,?,?,?,?,?)""",
-        (
-            category,
-            goal,
-            scheduled_at,
-            progress,
-            notes,
-            interaction.user.id,
-            iso(),
-        ),
-    )
-
-    await interaction.response.send_message(
-        f"🏋️ Training goal **{goal}** saved."
-    )
-
-
-@tree.command(name="training", description="Show training plans")
-@team_only()
-async def training_command(interaction: discord.Interaction):
-    rows = execute(
-        "SELECT * FROM training ORDER BY id DESC LIMIT 25",
-        fetch=True,
-    )
-
-    if not rows:
-        await interaction.response.send_message("🏋️ No training plans.")
-        return
-
-    lines = ["🏋️ **TRAINING PLANS**", ""]
-    for row in rows:
-        lines.append(
-            f"**#{row['id']} {row['category']}** — {row['goal']}\n"
-            f"Time: `{row['scheduled_at'] or '-'}` | "
-            f"Progress: `{row['progress'] or '-'}`"
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                category,
+                title,
+                goals,
+                progress,
+                notes,
+                interaction.user.id,
+                now_iso()
+            )
         )
 
-    await interaction.response.send_message("\n".join(lines))
+        conn.commit()
+        conn.close()
+
+    await interaction.response.send_message(
+        f"🏋️ Training added: **{title}**"
+    )
+
+
+@bot.tree.command(
+    name="training",
+    description="Show training plans"
+)
+@team_only()
+async def training(interaction):
+
+    with DB_LOCK:
+        conn = db()
+
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM training
+            ORDER BY id DESC
+            LIMIT 15
+            """
+        ).fetchall()
+
+        conn.close()
+
+    lines = ["🏋️ **TEAM XYZ TRAINING**", ""]
+
+    for r in rows:
+
+        lines.append(
+            f"**{r['title']}**\n"
+            f"Category: {r['category']}\n"
+            f"Goals: {r['goals']}\n"
+            f"Progress: {r['progress']}\n"
+            f"Notes: {r['notes']}\n"
+        )
+
+    if len(lines) == 2:
+        lines.append("No training plans yet.")
+
+    await send_long(
+        interaction,
+        "\n".join(lines)
+    )
 
 
 # ============================================================
 # ACHIEVEMENTS
 # ============================================================
 
-@tree.command(name="achievement_add", description="Add achievement")
+@bot.tree.command(
+    name="achievement_add",
+    description="Add player achievement"
+)
 @team_only()
 async def achievement_add(
-    interaction: discord.Interaction,
+    interaction,
+    player: discord.Member,
     title: str,
-    description: str = "",
-    user: discord.User = None,
+    description: str
 ):
-    if user and user.id not in TEAM_IDS:
+
+    if player.id not in TEAM:
         await interaction.response.send_message(
-            "❌ Not a TEAM XYZ member.",
-            ephemeral=True,
+            "❌ TEAM XYZ member only."
         )
         return
 
-    execute(
-        """INSERT INTO achievements
-           (title,description,user_id,achieved_at)
-           VALUES(?,?,?,?)""",
-        (
-            title,
-            description,
-            user.id if user else None,
-            iso(),
-        ),
+    with DB_LOCK:
+        conn = db()
+
+        conn.execute(
+            """
+            INSERT INTO achievements
+            (
+                player_id,
+                title,
+                description,
+                achieved_at,
+                created_by
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                player.id,
+                title,
+                description,
+                now_iso(),
+                interaction.user.id
+            )
+        )
+
+        conn.commit()
+        conn.close()
+
+    await interaction.response.send_message(
+        f"🏅 Achievement added for **{player.display_name}**"
+    )
+
+
+@bot.tree.command(
+    name="achievements",
+    description="Show achievements"
+)
+@team_only()
+async def achievements(interaction):
+
+    with DB_LOCK:
+        conn = db()
+
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM achievements
+            ORDER BY id DESC
+            LIMIT 20
+            """
+        ).fetchall()
+
+        conn.close()
+
+    lines = ["🏅 **TEAM XYZ ACHIEVEMENTS**", ""]
+
+    for r in rows:
+
+        info = member_info(r["player_id"])
+
+        lines.append(
+            f"🏆 **{info['name']} — {r['title']}**\n"
+            f"{r['description']}\n"
+        )
+
+    if len(lines) == 2:
+        lines.append("No achievements yet.")
+
+    await send_long(
+        interaction,
+        "\n".join(lines)
+    )
+
+
+# ============================================================
+# ANNOUNCEMENT
+# ============================================================
+
+@bot.tree.command(
+    name="announce",
+    description="Send team announcement"
+)
+@team_only()
+async def announce(
+    interaction,
+    content: str,
+    channel: discord.TextChannel = None
+):
+
+    target = channel or interaction.channel
+
+    await target.send(
+        f"📢 **TEAM XYZ ANNOUNCEMENT**\n\n{content}"
+    )
+
+    log_activity(
+        interaction.user.id,
+        "Sent announcement"
     )
 
     await interaction.response.send_message(
-        f"🏅 Achievement **{title}** added."
+        "✅ Announcement sent.",
+        ephemeral=True
     )
 
 
-@tree.command(name="achievements", description="Show achievements")
+# ============================================================
+# FILES
+# ============================================================
+
+@bot.tree.command(
+    name="files",
+    description="Show stored TEAM XYZ files"
+)
 @team_only()
-async def achievements_command(interaction: discord.Interaction):
-    rows = execute(
-        "SELECT * FROM achievements ORDER BY id DESC LIMIT 30",
-        fetch=True,
-    )
+async def files(interaction):
 
-    if not rows:
-        await interaction.response.send_message("🏅 No achievements.")
-        return
+    with DB_LOCK:
+        conn = db()
 
-    lines = ["🏅 **ACHIEVEMENTS**", ""]
-    for row in rows:
-        who = (
-            member_text(row["user_id"])
-            if row["user_id"]
-            else "TEAM XYZ"
-        )
-        lines.append(
-            f"• **{row['title']}** — {who}\n"
-            f"  {row['description'] or ''}"
-        )
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM files
+            ORDER BY id DESC
+            LIMIT 25
+            """
+        ).fetchall()
 
-    await interaction.response.send_message("\n".join(lines))
-
-
-# ============================================================
-# ANNOUNCEMENTS
-# ============================================================
-
-@tree.command(name="announce", description="Send or schedule announcement")
-@team_only()
-async def announce_command(
-    interaction: discord.Interaction,
-    content: str,
-    channel: discord.TextChannel = None,
-    scheduled_at: str = "",
-):
-    target = channel or interaction.channel
-
-    if not isinstance(target, discord.TextChannel):
-        await interaction.response.send_message(
-            "❌ Text channel required.",
-            ephemeral=True,
-        )
-        return
-
-    if scheduled_at:
-        try:
-            dt = parse_datetime(scheduled_at)
-        except Exception:
-            await interaction.response.send_message(
-                "❌ Invalid time.",
-                ephemeral=True,
-            )
-            return
-
-        execute(
-            """INSERT INTO announcements
-               (content,scheduled_at,channel_id,created_by,created_at)
-               VALUES(?,?,?,?,?)""",
-            (
-                content,
-                dt.isoformat(),
-                target.id,
-                interaction.user.id,
-                iso(),
-            ),
-        )
-
-        await interaction.response.send_message(
-            f"📢 Scheduled for `{dt.isoformat()}` in {target.mention}."
-        )
-    else:
-        await target.send(
-            f"📢 **{BRAND} ANNOUNCEMENT**\n{content}"
-        )
-        await interaction.response.send_message(
-            "✅ Announcement sent.",
-            ephemeral=True,
-        )
-
-
-# ============================================================
-# FILE STORAGE
-# ============================================================
-
-async def save_attachments(message: discord.Message):
-    if not STORAGE_CHANNEL_ID:
-        print("Attachment received but STORAGE_CHANNEL_ID is not configured.")
-        return
-
-    try:
-        storage = bot.get_channel(STORAGE_CHANNEL_ID)
-
-        if storage is None:
-            storage = await bot.fetch_channel(STORAGE_CHANNEL_ID)
-
-        if not isinstance(storage, discord.TextChannel):
-            print("Storage channel is not a text channel.")
-            return
-
-        for attachment in message.attachments:
-            try:
-                data = await attachment.read()
-                discord_file = discord.File(
-                    io.BytesIO(data),
-                    filename=attachment.filename,
-                )
-
-                sent = await storage.send(
-                    content=(
-                        f"📦 **{BRAND} STORAGE**\n"
-                        f"Uploader: <@{message.author.id}> "
-                        f"({TEAM[message.author.id]['role']})\n"
-                        f"Original message: `{message.id}`"
-                    ),
-                    file=discord_file,
-                )
-
-                stored_attachment = (
-                    sent.attachments[0]
-                    if sent.attachments
-                    else None
-                )
-
-                execute(
-                    """INSERT INTO files
-                       (file_name,file_type,file_size,uploader_id,
-                        uploaded_at,storage_channel_id,
-                        storage_message_id,storage_url)
-                       VALUES(?,?,?,?,?,?,?,?)""",
-                    (
-                        attachment.filename,
-                        attachment.content_type or "unknown",
-                        attachment.size,
-                        message.author.id,
-                        iso(),
-                        storage.id,
-                        sent.id,
-                        stored_attachment.url
-                        if stored_attachment
-                        else "",
-                    ),
-                )
-
-                log_activity(
-                    message.author.id,
-                    "file_upload",
-                    attachment.filename,
-                )
-
-            except Exception as exc:
-                print("Attachment upload error:", exc)
-
-    except Exception as exc:
-        print("Storage channel error:", exc)
-
-
-@tree.command(name="files", description="Show team stored files")
-@team_only()
-async def files_command(interaction: discord.Interaction):
-    rows = execute(
-        "SELECT * FROM files ORDER BY id DESC LIMIT 25",
-        fetch=True,
-    )
+        conn.close()
 
     if not rows:
         await interaction.response.send_message(
-            "📁 No stored files."
+            "📁 No team files stored yet."
         )
         return
 
-    lines = ["📁 **TEAM XYZ FILES**", ""]
+    lines = ["📁 **TEAM XYZ FILE STORAGE**", ""]
 
-    for row in rows:
+    for r in rows:
+
+        info = member_info(r["uploader_id"])
+
         lines.append(
-            f"**#{row['id']} {row['file_name']}**\n"
-            f"Type: `{row['file_type'] or '-'}` | "
-            f"Size: `{row['file_size']} bytes`\n"
-            f"By: <@{row['uploader_id']}>\n"
-            f"{row['storage_url'] or 'No storage URL'}"
+            f"📄 **{r['filename']}**\n"
+            f"Uploader: {info['name']}\n"
+            f"Size: {r['size']} bytes\n"
+            f"[Open storage message]({r['storage_url']})\n"
         )
 
-    await interaction.response.send_message("\n".join(lines))
+    await send_long(
+        interaction,
+        "\n".join(lines)
+    )
 
 
 # ============================================================
 # DASHBOARD
 # ============================================================
 
-@tree.command(name="dashboard", description="Show team dashboard")
+@bot.tree.command(
+    name="dashboard",
+    description="TEAM XYZ dashboard"
+)
 @team_only()
-async def dashboard_command(interaction: discord.Interaction):
-    tables = [
-        "scrims",
-        "tournaments",
-        "matches",
-        "player_stats",
-        "strategies",
-        "training",
-        "achievements",
-        "files",
-    ]
+async def dashboard(interaction):
 
-    counts = {}
+    with DB_LOCK:
+        conn = db()
 
-    for table in tables:
-        rows = execute(
-            f"SELECT COUNT(*) AS c FROM {table}",
-            fetch=True,
-        )
-        counts[table] = rows[0]["c"]
+        scrims = conn.execute(
+            "SELECT COUNT(*) c FROM scrims"
+        ).fetchone()["c"]
+
+        tournaments = conn.execute(
+            "SELECT COUNT(*) c FROM tournaments"
+        ).fetchone()["c"]
+
+        matches = conn.execute(
+            "SELECT COUNT(*) c FROM matches"
+        ).fetchone()["c"]
+
+        stats_count = conn.execute(
+            "SELECT COUNT(*) c FROM player_stats"
+        ).fetchone()["c"]
+
+        strategies_count = conn.execute(
+            "SELECT COUNT(*) c FROM strategies"
+        ).fetchone()["c"]
+
+        training_count = conn.execute(
+            "SELECT COUNT(*) c FROM training"
+        ).fetchone()["c"]
+
+        files_count = conn.execute(
+            "SELECT COUNT(*) c FROM files"
+        ).fetchone()["c"]
+
+        conn.close()
 
     await interaction.response.send_message(
-        f"📈 **{BRAND} DASHBOARD**\n\n"
-        f"Members: **4**\n"
-        f"Scrims: **{counts['scrims']}**\n"
-        f"Tournaments: **{counts['tournaments']}**\n"
-        f"Matches: **{counts['matches']}**\n"
-        f"Stat records: **{counts['player_stats']}**\n"
-        f"Strategies: **{counts['strategies']}**\n"
-        f"Training: **{counts['training']}**\n"
-        f"Achievements: **{counts['achievements']}**\n"
-        f"Files: **{counts['files']}**\n"
-        f"Storage: **{'Configured' if STORAGE_CHANNEL_ID else 'Not configured'}**"
+        "📈 **TEAM XYZ DASHBOARD**\n\n"
+        f"👥 Members: **4**\n"
+        f"⚔️ Scrims: **{scrims}**\n"
+        f"🏆 Tournaments: **{tournaments}**\n"
+        f"🎯 Matches: **{matches}**\n"
+        f"📊 Stat records: **{stats_count}**\n"
+        f"🧠 Strategies: **{strategies_count}**\n"
+        f"🏋️ Training plans: **{training_count}**\n"
+        f"📁 Files: **{files_count}**"
     )
 
 
-@tree.command(name="activity", description="Show recent activity")
+# ============================================================
+# ACTIVITY
+# ============================================================
+
+@bot.tree.command(
+    name="activity",
+    description="Show recent team activity"
+)
 @team_only()
-async def activity_command(interaction: discord.Interaction):
-    rows = execute(
-        "SELECT * FROM activity ORDER BY id DESC LIMIT 25",
-        fetch=True,
+async def activity(interaction):
+
+    with DB_LOCK:
+        conn = db()
+
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM activity
+            ORDER BY id DESC
+            LIMIT 30
+            """
+        ).fetchall()
+
+        conn.close()
+
+    lines = ["🕒 **TEAM XYZ ACTIVITY**", ""]
+
+    for r in rows:
+
+        info = member_info(r["user_id"])
+
+        lines.append(
+            f"**{info['name']}** — {r['action']}\n"
+            f"{r['created_at']}\n"
+        )
+
+    if len(lines) == 2:
+        lines.append("No activity yet.")
+
+    await send_long(
+        interaction,
+        "\n".join(lines)
     )
 
-    if not rows:
-        await interaction.response.send_message(
-            "🕒 No activity."
-        )
-        return
-
-    lines = ["🕒 **RECENT ACTIVITY**", ""]
-
-    for row in rows:
-        lines.append(
-            f"• `{row['created_at']}` — "
-            f"<@{row['user_id']}> — "
-            f"**{row['action']}** — "
-            f"{row['details'] or ''}"
-        )
-
-    await interaction.response.send_message("\n".join(lines))
-
 
 # ============================================================
-# GEMINI AI
+# GEMINI
 # ============================================================
 
-def make_ai_context(user_id: int):
-    info = TEAM[user_id]
+def build_ai_context(user_id):
 
-    parts = [
-        f"Team: {BRAND}",
-        f"Current member: {info['name']}",
-        f"Current member role: {info['role']}",
-        "",
-        "ROSTER:",
-    ]
+    info = member_info(user_id)
+
+    with DB_LOCK:
+        conn = db()
+
+        scrims = conn.execute(
+            """
+            SELECT opponent, scheduled_at, map, result, notes
+            FROM scrims
+            ORDER BY id DESC
+            LIMIT 8
+            """
+        ).fetchall()
+
+        tournaments = conn.execute(
+            """
+            SELECT name, scheduled_at, placement, points, result
+            FROM tournaments
+            ORDER BY id DESC
+            LIMIT 5
+            """
+        ).fetchall()
+
+        matches = conn.execute(
+            """
+            SELECT title, opponent, map,
+                   placement, team_kills, result
+            FROM matches
+            ORDER BY id DESC
+            LIMIT 8
+            """
+        ).fetchall()
+
+        stats = conn.execute(
+            """
+            SELECT player_id, kills, damage,
+                   placement, booyah, points
+            FROM player_stats
+            ORDER BY id DESC
+            LIMIT 20
+            """
+        ).fetchall()
+
+        strategies = conn.execute(
+            """
+            SELECT category, title, content
+            FROM strategies
+            ORDER BY id DESC
+            LIMIT 8
+            """
+        ).fetchall()
+
+        training = conn.execute(
+            """
+            SELECT category, title, goals,
+                   progress, notes
+            FROM training
+            ORDER BY id DESC
+            LIMIT 8
+            """
+        ).fetchall()
+
+        chat = conn.execute(
+            """
+            SELECT author_id, content, created_at
+            FROM chat_context
+            ORDER BY id DESC
+            LIMIT 12
+            """
+        ).fetchall()
+
+        conn.close()
+
+    roster = []
 
     for uid, member in TEAM.items():
-        parts.append(
-            f"- {member['name']} | {member['role']} | Discord ID {uid}"
-        )
 
-    parts.append("\nRECENT SCRIMS:")
-    for row in execute(
-        """SELECT opponent,scheduled_at,map,result,notes
-           FROM scrims ORDER BY id DESC LIMIT 10""",
-        fetch=True,
-    ):
-        parts.append(str(dict(row)))
+        roster.append({
+            "name": member["name"],
+            "role": member["role"]
+        })
 
-    parts.append("\nRECENT TOURNAMENTS:")
-    for row in execute(
-        """SELECT name,scheduled_at,result,placement,points,notes
-           FROM tournaments ORDER BY id DESC LIMIT 10""",
-        fetch=True,
-    ):
-        parts.append(str(dict(row)))
+    def clean_rows(rows):
+        return [
+            dict(r)
+            for r in rows
+        ]
 
-    parts.append("\nMATCHES:")
-    for row in execute(
-        """SELECT title,opponent,match_type,scheduled_at,map,result,notes
-           FROM matches ORDER BY id DESC LIMIT 10""",
-        fetch=True,
-    ):
-        parts.append(str(dict(row)))
+    context = {
+        "team": "TEAM XYZ",
+        "current_member": info["name"],
+        "current_role": info["role"],
+        "roster": roster,
+        "recent_scrims": clean_rows(scrims),
+        "recent_tournaments": clean_rows(tournaments),
+        "recent_matches": clean_rows(matches),
+        "recent_stats": clean_rows(stats),
+        "recent_strategies": clean_rows(strategies),
+        "recent_training": clean_rows(training),
+        "recent_chat": clean_rows(chat),
+    }
 
-    parts.append("\nPLAYER STATS:")
-    for row in execute(
-        """SELECT user_id,
-                  COUNT(*) games,
-                  SUM(kills) kills,
-                  SUM(damage) damage,
-                  SUM(booyah) booyah,
-                  SUM(points) points
-           FROM player_stats
-           GROUP BY user_id""",
-        fetch=True,
-    ):
-        parts.append(
-            f"{member_text(row['user_id'])}: {dict(row)}"
-        )
+    raw = json.dumps(
+        context,
+        ensure_ascii=False,
+        separators=(",", ":")
+    )
 
-    parts.append("\nSTRATEGIES:")
-    for row in execute(
-        """SELECT category,title,content
-           FROM strategies ORDER BY id DESC LIMIT 15""",
-        fetch=True,
-    ):
-        parts.append(str(dict(row)))
-
-    parts.append("\nTRAINING:")
-    for row in execute(
-        """SELECT category,goal,scheduled_at,progress,notes
-           FROM training ORDER BY id DESC LIMIT 15""",
-        fetch=True,
-    ):
-        parts.append(str(dict(row)))
-
-    parts.append("\nRECENT TEAM CHAT:")
-    for row in execute(
-        """SELECT user_id,content,created_at
-           FROM chat_context ORDER BY id DESC LIMIT 40""",
-        fetch=True,
-    ):
-        parts.append(
-            f"{member_text(row['user_id'])}: {row['content']}"
-        )
-
-    return "\n".join(parts)[-30000:]
+    # Hard context limit.
+    return raw[:14000]
 
 
-@tree.command(
-    name="ai",
-    description="Ask TEAM XYZ Gemini esports assistant",
-)
-@app_commands.describe(question="Your question")
-@team_only()
-async def ai_command(
-    interaction: discord.Interaction,
-    question: str,
-):
-    if not GEMINI_API_KEY:
-        await interaction.response.send_message(
-            "❌ GEMINI_API_KEY is not configured in Render.",
-            ephemeral=True,
-        )
-        return
-
-    if gemini_client is None:
-        await interaction.response.send_message(
-            "❌ Gemini client is unavailable. Check API key and package.",
-            ephemeral=True,
-        )
-        return
-
-    await interaction.response.defer()
-
-    context = make_ai_context(interaction.user.id)
-
-    prompt = f"""
-You are the official AI esports assistant for {BRAND}.
-
-The user explicitly invoked /ai.
-Do not respond to normal chat automatically.
-
-Use the supplied team context.
-Know each player's role.
-Give role-specific Free Fire esports advice.
-Do not invent team facts.
-Be practical and concise.
-
-TEAM CONTEXT:
-{context}
-
-USER QUESTION:
-{question}
-"""
+async def gemini_request(prompt, context):
 
     try:
-        response = await asyncio.to_thread(
-            gemini_client.models.generate_content,
-            model=GEMINI_MODEL,
-            contents=prompt,
+        from google import genai
+
+    except ImportError:
+        raise RuntimeError(
+            "google-genai package is not installed."
         )
 
-        answer = getattr(response, "text", None)
+    client = genai.Client(
+        api_key=GEMINI_API_KEY
+    )
 
-        if not answer:
-            answer = "Gemini returned no text."
+    system_prompt = """
+You are the official AI esports assistant for TEAM XYZ,
+a Free Fire esports team.
 
-        if len(answer) > 1900:
-            answer = answer[:1900] + "\n…"
+TEAM XYZ has four equal members:
 
-        await interaction.followup.send(
+Nirav - IGL + Primary Rusher
+KRUTIK - Sniper
+Dakshit - Supporter
+Atul - Secondary Rusher
+
+Give practical Free Fire esports advice.
+
+Use the supplied team context when relevant.
+
+Never invent:
+- match results
+- statistics
+- tournament results
+- player information
+- team discussions
+
+If data is missing, say that it is missing.
+
+Adapt advice to the member's role.
+
+Be concise but useful.
+
+The user is asking through the TEAM XYZ Discord bot.
+"""
+
+    full_prompt = (
+        system_prompt
+        + "\n\nTEAM CONTEXT:\n"
+        + context
+        + "\n\nUSER QUESTION:\n"
+        + prompt[:3500]
+    )
+
+    last_error = None
+
+    for attempt in range(AI_RETRIES):
+
+        try:
+
+            async with ai_semaphore:
+
+                response = await asyncio.to_thread(
+                    client.models.generate_content,
+                    model=GEMINI_MODEL,
+                    contents=full_prompt
+                )
+
+            text = getattr(
+                response,
+                "text",
+                None
+            )
+
+            if not text:
+                return (
+                    "⚠️ Gemini returned an empty response."
+                )
+
+            return text.strip()
+
+        except Exception as e:
+
+            last_error = e
+
+            error_text = str(e).lower()
+
+            is_429 = (
+                "429" in error_text
+                or "resource_exhausted" in error_text
+                or "quota" in error_text
+                or "rate limit" in error_text
+            )
+
+            is_503 = (
+                "503" in error_text
+                or "unavailable" in error_text
+                or "high demand" in error_text
+                or "service unavailable" in error_text
+            )
+
+            # IMPORTANT:
+            # Quota exhaustion should NOT be retried endlessly.
+            if is_429 and (
+                "quota" in error_text
+                or "exceeded your current quota" in error_text
+                or "free_tier" in error_text
+            ):
+                return (
+                    "⚠️ **Gemini quota exhausted.**\n\n"
+                    "Your Gemini API project has reached "
+                    "its current request quota. "
+                    "Please check Google AI Studio/API quota "
+                    "and try again after the quota resets."
+                )
+
+            if not (is_429 or is_503):
+                break
+
+            if attempt >= AI_RETRIES - 1:
+                break
+
+            delay = (2 ** attempt) + random.uniform(
+                0.5,
+                1.5
+            )
+
+            await asyncio.sleep(delay)
+
+    print(
+        "Gemini request failed:",
+        repr(last_error)
+    )
+
+    if last_error:
+
+        error_text = str(last_error).lower()
+
+        if "429" in error_text:
+            return (
+                "⚠️ Gemini request limit reached. "
+                "Please try again later."
+            )
+
+        if "503" in error_text:
+            return (
+                "⚠️ Gemini is temporarily unavailable "
+                "because the service is busy. "
+                "Please try /ai again shortly."
+            )
+
+    return (
+        "⚠️ AI request failed temporarily. "
+        "The Discord bot itself is still running."
+    )
+
+
+# ============================================================
+# /AI
+# ============================================================
+
+@bot.tree.command(
+    name="ai",
+    description="Ask the TEAM XYZ AI esports assistant"
+)
+@app_commands.describe(
+    prompt="Your question"
+)
+@team_only()
+async def ai(
+    interaction: discord.Interaction,
+    prompt: str
+):
+
+    if not GEMINI_API_KEY:
+
+        await interaction.response.send_message(
+            "❌ `GEMINI_API_KEY` is not configured "
+            "in Render Environment Variables.",
+            ephemeral=True
+        )
+
+        return
+
+    prompt = (prompt or "").strip()
+
+    if not prompt:
+
+        await interaction.response.send_message(
+            "❌ Please enter your question.",
+            ephemeral=True
+        )
+
+        return
+
+    # Defer immediately so Discord does not timeout.
+    await interaction.response.defer()
+
+    member = member_info(
+        interaction.user.id
+    )
+
+    log_activity(
+        interaction.user.id,
+        f"Used /ai: {prompt[:150]}"
+    )
+
+    try:
+
+        context = await asyncio.to_thread(
+            build_ai_context,
+            interaction.user.id
+        )
+
+        answer = await gemini_request(
+            prompt,
+            context
+        )
+
+        header = (
             f"🤖 **TEAM XYZ AI — "
-            f"{TEAM[interaction.user.id]['name']}**\n{answer}"
+            f"{member['name']} ({member['role']})**\n\n"
         )
 
-        log_activity(
-            interaction.user.id,
-            "ai",
-            question[:300],
+        await send_long(
+            interaction,
+            header + answer
         )
 
-    except Exception as exc:
-        await interaction.followup.send(
-            f"❌ Gemini error:\n`{type(exc).__name__}: "
-            f"{str(exc)[:700]}`"
+    except Exception as e:
+
+        print(
+            "AI command error:",
+            repr(e)
         )
+
+        try:
+
+            await interaction.followup.send(
+                "⚠️ AI error occurred, "
+                "but the TEAM XYZ bot is still running."
+            )
+
+        except Exception:
+            pass
 
 
 # ============================================================
 # REMINDERS
 # ============================================================
 
-@tasks.loop(seconds=30)
+@tasks.loop(minutes=1)
 async def reminder_loop():
-    current = utcnow()
-    limit = current + timedelta(minutes=10)
 
-    rows = execute(
-        """SELECT * FROM scrims
-           WHERE reminder_sent=0
-           AND result=''
-           ORDER BY scheduled_at LIMIT 50""",
-        fetch=True,
-    )
+    try:
 
-    for row in rows:
-        try:
-            scheduled = parse_datetime(row["scheduled_at"])
-        except Exception:
-            continue
+        now = datetime.now(timezone.utc)
 
-        if current <= scheduled <= limit:
-            for uid in TEAM_IDS:
-                try:
-                    user = bot.get_user(uid)
+        with DB_LOCK:
+            conn = db()
 
-                    if user is None:
-                        user = await bot.fetch_user(uid)
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM scrims
+                WHERE result IS NULL
+                OR result = ''
+                """
+            ).fetchall()
 
-                    await user.send(
-                        f"⏰ **TEAM XYZ SCRIM REMINDER**\n"
-                        f"Opponent: **{row['opponent']}**\n"
-                        f"Time UTC: `{row['scheduled_at']}`\n"
-                        f"Map: `{row['map'] or '-'}`\n"
-                        f"Room: `{row['room_id'] or '-'}`"
-                    )
-                except Exception as exc:
-                    print("Reminder DM error:", exc)
+            conn.close()
 
-            execute(
-                "UPDATE scrims SET reminder_sent=1 WHERE id=?",
-                (row["id"],),
-            )
+        for r in rows:
+
+            try:
+
+                # Expected format:
+                # 2026-09-20 18:30
+                dt = datetime.strptime(
+                    r["scheduled_at"],
+                    "%Y-%m-%d %H:%M"
+                ).replace(
+                    tzinfo=timezone.utc
+                )
+
+                seconds = (
+                    dt - now
+                ).total_seconds()
+
+                if 0 < seconds <= 600:
+
+                    for user_id in TEAM:
+
+                        try:
+
+                            user = bot.get_user(
+                                user_id
+                            )
+
+                            if user:
+
+                                await user.send(
+                                    f"⏰ **TEAM XYZ SCRIM REMINDER**\n"
+                                    f"Opponent: **{r['opponent']}**\n"
+                                    f"Time: {r['scheduled_at']} UTC\n"
+                                    f"Map: {r['map']}\n"
+                                    f"Room: `{r['room_id'] or 'N/A'}`"
+                                )
+
+                        except Exception:
+                            pass
+
+            except Exception:
+                continue
+
+    except Exception as e:
+
+        print(
+            "Reminder loop error:",
+            repr(e)
+        )
 
 
 @reminder_loop.before_loop
-async def before_reminders():
-    await bot.wait_until_ready()
+async def before_reminder():
 
-
-@tasks.loop(seconds=30)
-async def announcement_loop():
-    current = utcnow()
-
-    rows = execute(
-        """SELECT * FROM announcements
-           WHERE sent=0
-           AND scheduled_at!=''
-           ORDER BY id LIMIT 50""",
-        fetch=True,
-    )
-
-    for row in rows:
-        try:
-            scheduled = parse_datetime(row["scheduled_at"])
-        except Exception:
-            continue
-
-        if scheduled <= current:
-            try:
-                channel = bot.get_channel(row["channel_id"])
-
-                if channel is None:
-                    channel = await bot.fetch_channel(row["channel_id"])
-
-                if isinstance(channel, discord.TextChannel):
-                    await channel.send(
-                        f"📢 **{BRAND} ANNOUNCEMENT**\n"
-                        f"{row['content']}"
-                    )
-
-                    execute(
-                        "UPDATE announcements SET sent=1 WHERE id=?",
-                        (row["id"],),
-                    )
-            except Exception as exc:
-                print("Scheduled announcement error:", exc)
-
-
-@announcement_loop.before_loop
-async def before_announcements():
     await bot.wait_until_ready()
 
 
 # ============================================================
-# ERROR HANDLING
+# SCHEDULED ANNOUNCEMENTS
+# ============================================================
+
+@tasks.loop(minutes=1)
+async def announcement_loop():
+
+    try:
+
+        with DB_LOCK:
+            conn = db()
+
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM announcements
+                WHERE sent=0
+                ORDER BY id ASC
+                """
+            ).fetchall()
+
+            conn.close()
+
+        now = datetime.now(timezone.utc)
+
+        for r in rows:
+
+            try:
+
+                dt = datetime.fromisoformat(
+                    r["scheduled_at"]
+                )
+
+                if dt.tzinfo is None:
+                    dt = dt.replace(
+                        tzinfo=timezone.utc
+                    )
+
+                if dt <= now:
+
+                    # Send to all members by DM.
+                    for user_id in TEAM:
+
+                        try:
+
+                            user = bot.get_user(
+                                user_id
+                            )
+
+                            if user:
+
+                                await user.send(
+                                    "📢 **TEAM XYZ ANNOUNCEMENT**\n\n"
+                                    + r["content"]
+                                )
+
+                        except Exception:
+                            pass
+
+                    with DB_LOCK:
+                        conn = db()
+
+                        conn.execute(
+                            """
+                            UPDATE announcements
+                            SET sent=1
+                            WHERE id=?
+                            """,
+                            (r["id"],)
+                        )
+
+                        conn.commit()
+                        conn.close()
+
+            except Exception:
+                continue
+
+    except Exception as e:
+
+        print(
+            "Announcement loop error:",
+            repr(e)
+        )
+
+
+@announcement_loop.before_loop
+async def before_announcement():
+
+    await bot.wait_until_ready()
+
+
+# ============================================================
+# APP COMMAND ERROR HANDLER
 # ============================================================
 
 @bot.tree.error
 async def on_app_command_error(
-    interaction: discord.Interaction,
-    error: app_commands.AppCommandError,
+    interaction,
+    error
 ):
-    if isinstance(error, app_commands.CheckFailure):
-        message = "❌ Only TEAM XYZ members can use this bot."
-    else:
-        message = f"❌ Command error: `{type(error).__name__}: {str(error)[:500]}`"
-        print("Command error:", repr(error))
+
+    print(
+        "APP COMMAND ERROR:",
+        repr(error)
+    )
 
     try:
-        if interaction.response.is_done():
-            await interaction.followup.send(message, ephemeral=True)
+
+        if isinstance(
+            error,
+            app_commands.CheckFailure
+        ):
+
+            message = (
+                "❌ This bot is available only "
+                "to TEAM XYZ members."
+            )
+
         else:
+
+            message = (
+                "⚠️ Command error occurred. "
+                "Please try again."
+            )
+
+        if interaction.response.is_done():
+
+            await interaction.followup.send(
+                message,
+                ephemeral=True
+            )
+
+        else:
+
             await interaction.response.send_message(
                 message,
-                ephemeral=True,
+                ephemeral=True
             )
+
     except Exception:
         pass
 
 
 # ============================================================
-# RENDER WEB SERVICE HEALTH SERVER
+# RENDER HEALTH SERVER
 # ============================================================
 
 class HealthHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
-        body = b"TEAM XYZ Discord Bot is running."
+
+        body = (
+            "TEAM XYZ Discord Bot is running."
+        ).encode()
 
         self.send_response(200)
         self.send_header(
             "Content-Type",
-            "text/plain; charset=utf-8",
+            "text/plain"
         )
         self.send_header(
             "Content-Length",
-            str(len(body)),
+            str(len(body))
         )
         self.end_headers()
+
         self.wfile.write(body)
 
-    def log_message(self, format, *args):
+    def log_message(
+        self,
+        format,
+        *args
+    ):
         return
 
 
 def start_health_server():
-    port = int(os.getenv("PORT", "10000"))
 
     server = HTTPServer(
-        ("0.0.0.0", port),
-        HealthHandler,
+        ("0.0.0.0", PORT),
+        HealthHandler
     )
 
-    print(f"Render health server listening on 0.0.0.0:{port}")
+    print(
+        f"Health server listening on port {PORT}"
+    )
 
     server.serve_forever()
 
 
 # ============================================================
-# MAIN
+# STARTUP
 # ============================================================
 
 def main():
+
+    if not DISCORD_TOKEN:
+
+        raise RuntimeError(
+            "DISCORD_TOKEN is missing."
+        )
+
     init_db()
 
     health_thread = threading.Thread(
         target=start_health_server,
-        daemon=True,
+        daemon=True
     )
+
     health_thread.start()
 
-    try:
-        bot.run(TOKEN)
-    finally:
-        with db_lock:
-            db.close()
+    bot.run(DISCORD_TOKEN)
 
 
 if __name__ == "__main__":
